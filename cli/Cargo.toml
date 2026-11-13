@@ -1,0 +1,31 @@
+[package]
+name = "jstime"
+version = "0.69.0"
+description = "Another JS Runtime"
+readme = "README.md"
+license = "Apache-2.0"
+authors = ["the jstime authors"]
+edition = "2024"
+repository = "https://github.com/jstime/jstime"
+default-run = "jstime"
+
+[[bin]]
+name = "jstime"
+path = "main.rs"
+
+[dependencies]
+jstime_core = { path = "../core", version = "^0.69.0" }
+rustyline = "19.0.0"
+structopt = "0.3.26"
+dirs = "7.0.0"
+rustc-hash = "2.1.2"
+
+[build-dependencies]
+jstime_core = { path = "../core", version = "^0.69.0" }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+
+[package.metadata.release]
+tag-prefix = ""

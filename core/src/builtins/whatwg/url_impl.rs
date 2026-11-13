@@ -1,0 +1,211 @@
+// High-performance URL implementation matching Deno's architecture
+// URLs stored in Rust, accessed via lazy getters
+
+use ada_url::Url;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+
+// Global URL storage - URLs stored by ID in Rust
+// Using FxHashMap for faster lookups with integer keys
+thread_local! {
+    static URL_STORAGE: RefCell<FxHashMap<u32, Url>> = RefCell::new(FxHashMap::default());
+    static NEXT_URL_ID: RefCell<u32> = const { RefCell::new(1) };
+}
+
+// Helper to allocate a new URL ID
+fn allocate_url_id() -> u32 {
+    NEXT_URL_ID.with(|id| {
+        let mut current = id.borrow_mut();
+        let new_id = *current;
+        *current += 1;
+        new_id
+    })
+}
+
+// Helper to store URL and return ID
+fn store_url(url: Url) -> u32 {
+    let id = allocate_url_id();
+    URL_STORAGE.with(|storage| {
+        storage.borrow_mut().insert(id, url);
+    });
+    id
+}
+
+// Helper to convert Rust string to V8 string
+#[inline]
+fn to_v8_string<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::String> {
+    v8::String::new(scope, s).unwrap()
+}
+
+// Helper to convert V8 value to Rust string
+#[inline]
+fn to_rust_string(scope: &mut v8::PinScope, val: v8::Local<v8::Value>) -> String {
+    val.to_string(scope).unwrap().to_rust_string_lossy(scope)
+}
+
+// URL parse function - returns URL ID
+fn url_parse(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if args.length() == 0 {
+        rv.set(v8::null(scope).into());
+        return;
+    }
+
+    let url_str = to_rust_string(scope, args.get(0));
+
+    let base = if args.length() > 1 && !args.get(1).is_undefined() {
+        Some(to_rust_string(scope, args.get(1)))
+    } else {
+        None
+    };
+
+    let parsed = if let Some(base_str) = base {
+        Url::parse(&url_str, Some(&base_str))
+    } else {
+        Url::parse(&url_str, None)
+    };
+
+    match parsed {
+        Ok(url) => {
+            let url_id = store_url(url);
+            let id_value = v8::Number::new(scope, url_id as f64);
+            rv.set(id_value.into());
+        }
+        Err(_) => {
+            rv.set(v8::null(scope).into());
+        }
+    }
+}
+
+// Get URL property by ID - optimized to avoid cloning
+fn url_get_property(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        rv.set(v8::undefined(scope).into());
+        return;
+    }
+
+    let id = args.get(0).number_value(scope).unwrap() as u32;
+    let prop = to_rust_string(scope, args.get(1));
+
+    // Access URL directly without cloning
+    URL_STORAGE.with(|storage| {
+        let storage_ref = storage.borrow();
+        if let Some(url) = storage_ref.get(&id) {
+            let value = match prop.as_str() {
+                "href" => url.as_str(),
+                "origin" => &url.origin(),
+                "protocol" => url.protocol(),
+                "username" => url.username(),
+                "password" => url.password(),
+                "host" => url.host(),
+                "hostname" => url.hostname(),
+                "port" => url.port(),
+                "pathname" => url.pathname(),
+                "search" => url.search(),
+                "hash" => url.hash(),
+                _ => "",
+            };
+            let v8_str = to_v8_string(scope, value);
+            rv.set(v8_str.into());
+        } else {
+            rv.set(v8::undefined(scope).into());
+        }
+    });
+}
+
+// Set URL property by ID - optimized to minimize cloning
+fn url_set_property(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if args.length() < 3 {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
+    }
+
+    let id = args.get(0).number_value(scope).unwrap() as u32;
+    let prop = to_rust_string(scope, args.get(1));
+    let value = to_rust_string(scope, args.get(2));
+
+    URL_STORAGE.with(|storage| {
+        let mut storage_mut = storage.borrow_mut();
+        if let Some(url) = storage_mut.get_mut(&id) {
+            match prop.as_str() {
+                "href" => {
+                    if let Ok(new_url) = Url::parse(&value, None) {
+                        *url = new_url;
+                        rv.set(v8::Boolean::new(scope, true).into());
+                        return;
+                    }
+                }
+                "protocol" => {
+                    let _ = url.set_protocol(&value);
+                    rv.set(v8::Boolean::new(scope, true).into());
+                    return;
+                }
+                "pathname" => {
+                    let _ = url.set_pathname(Some(&value));
+                    rv.set(v8::Boolean::new(scope, true).into());
+                    return;
+                }
+                "search" => {
+                    if value.is_empty() || value == "?" {
+                        url.set_search(None);
+                    } else {
+                        url.set_search(Some(&value));
+                    }
+                    rv.set(v8::Boolean::new(scope, true).into());
+                    return;
+                }
+                "hash" => {
+                    if value.is_empty() || value == "#" {
+                        url.set_hash(None);
+                    } else {
+                        url.set_hash(Some(&value));
+                    }
+                    rv.set(v8::Boolean::new(scope, true).into());
+                    return;
+                }
+                _ => {}
+            }
+        }
+        rv.set(v8::Boolean::new(scope, false).into());
+    });
+}
+
+pub(crate) fn get_external_references() -> Vec<v8::ExternalReference> {
+    vec![
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(url_parse),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(url_get_property),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(url_set_property),
+        },
+    ]
+}
+
+pub(crate) fn register_bindings(scope: &mut v8::PinScope, bindings: v8::Local<v8::Object>) {
+    // Macro for binding functions
+    macro_rules! binding {
+        ($name:expr, $func:expr) => {
+            let key = to_v8_string(scope, $name);
+            let val = v8::Function::new(scope, $func).unwrap();
+            bindings.set(scope, key.into(), val.into());
+        };
+    }
+
+    binding!("urlParse", url_parse);
+    binding!("urlGetProperty", url_get_property);
+    binding!("urlSetProperty", url_set_property);
+}

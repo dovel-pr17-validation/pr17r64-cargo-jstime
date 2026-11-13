@@ -1,0 +1,1312 @@
+use ring::aead::BoundKey;
+use ring::digest;
+use ring::{aead, hmac};
+
+pub(crate) fn get_external_references() -> Vec<v8::ExternalReference> {
+    vec![
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_get_random_values),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_random_uuid),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_digest),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_sign),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_verify),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_encrypt),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_decrypt),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_generate_key),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_import_key),
+        },
+        v8::ExternalReference {
+            function: v8::MapFnTo::map_fn_to(crypto_subtle_export_key),
+        },
+    ]
+}
+
+pub(crate) fn register_bindings(scope: &mut v8::PinScope, bindings: v8::Local<v8::Object>) {
+    let name = v8::String::new(scope, "cryptoGetRandomValues").unwrap();
+    let value = v8::Function::new(scope, crypto_get_random_values).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoRandomUUID").unwrap();
+    let value = v8::Function::new(scope, crypto_random_uuid).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleDigest").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_digest).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleSign").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_sign).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleVerify").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_verify).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleEncrypt").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_encrypt).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleDecrypt").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_decrypt).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleGenerateKey").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_generate_key).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleImportKey").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_import_key).unwrap();
+    bindings.set(scope, name.into(), value.into());
+
+    let name = v8::String::new(scope, "cryptoSubtleExportKey").unwrap();
+    let value = v8::Function::new(scope, crypto_subtle_export_key).unwrap();
+    bindings.set(scope, name.into(), value.into());
+}
+
+// crypto.getRandomValues(typedArray)
+#[inline]
+fn crypto_get_random_values(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 1, "crypto.getRandomValues") {
+        return;
+    }
+
+    let array = args.get(0);
+
+    // Check if it's a TypedArray
+    if !array.is_typed_array() {
+        crate::error::throw_type_error(
+            scope,
+            "crypto.getRandomValues: argument 1 is not a TypedArray",
+        );
+        return;
+    }
+
+    let typed_array = v8::Local::<v8::TypedArray>::try_from(array).unwrap();
+
+    let byte_length = typed_array.byte_length();
+
+    // Early return for empty arrays
+    if byte_length == 0 {
+        rv.set(array);
+        return;
+    }
+
+    // Check size (spec says max 65536 bytes)
+    if byte_length > 65536 {
+        crate::error::throw_error(
+            scope,
+            "crypto.getRandomValues: array size exceeds 65536 bytes",
+        );
+        return;
+    }
+
+    // Get the underlying ArrayBuffer and fill it with random data
+    let buffer = typed_array.buffer(scope).unwrap();
+    let backing_store = buffer.get_backing_store();
+    let byte_offset = typed_array.byte_offset();
+
+    // Get mutable slice to the typed array data, considering byte_offset
+    // SAFETY: V8 guarantees that byte_offset + byte_length <= backing_store.byte_length()
+    // for valid typed arrays, so this pointer arithmetic is safe
+    let data = unsafe {
+        std::slice::from_raw_parts_mut(
+            (backing_store.data().unwrap().as_ptr() as *mut u8).add(byte_offset),
+            byte_length,
+        )
+    };
+
+    // Fill with random bytes using buffered random generator
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let result = {
+        let state_ref = state.borrow();
+        let mut buffered_random = state_ref.buffered_random.borrow_mut();
+        buffered_random.fill(data)
+    };
+
+    if result.is_err() {
+        crate::error::throw_error(scope, "Failed to generate random values");
+        return;
+    }
+
+    // Return the same array
+    rv.set(array);
+}
+
+// Helper function to convert byte to lowercase hex (always 2 chars)
+#[inline]
+const fn byte_to_hex(byte: u8) -> (u8, u8) {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    (
+        HEX_CHARS[(byte >> 4) as usize],
+        HEX_CHARS[(byte & 0x0f) as usize],
+    )
+}
+
+// crypto.randomUUID()
+// Optimized to avoid slow format! macro - directly formats UUID into pre-allocated buffer
+#[inline]
+fn crypto_random_uuid(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let mut bytes = [0u8; 16];
+    {
+        let state = crate::isolate_state::IsolateState::get(scope);
+        let state_ref = state.borrow();
+        let mut buffered_random = state_ref.buffered_random.borrow_mut();
+        if buffered_random.fill(&mut bytes).is_err() {
+            drop(buffered_random);
+            drop(state_ref);
+            crate::error::throw_error(scope, "Failed to generate random UUID");
+            return;
+        }
+    }
+
+    // Set version to 4 (random)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    // Set variant to RFC 4122
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    // Format as UUID string: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 bytes)
+    // Pre-allocate buffer with exact size to avoid allocations
+    // Use manual unrolled loop for better performance
+    let mut uuid_buf = [0u8; 36];
+
+    // Unrolled formatting for optimal performance
+    // Use a macro to avoid repetitive code while keeping the loop fully unrolled at compile time
+    // This eliminates branches and makes the code more maintainable than 16 separate calls
+    macro_rules! write_hex {
+        ($pos:expr, $byte:expr) => {{
+            let (hi, lo) = byte_to_hex($byte);
+            uuid_buf[$pos] = hi;
+            uuid_buf[$pos + 1] = lo;
+        }};
+    }
+
+    write_hex!(0, bytes[0]);
+    write_hex!(2, bytes[1]);
+    write_hex!(4, bytes[2]);
+    write_hex!(6, bytes[3]);
+    uuid_buf[8] = b'-';
+    write_hex!(9, bytes[4]);
+    write_hex!(11, bytes[5]);
+    uuid_buf[13] = b'-';
+    write_hex!(14, bytes[6]);
+    write_hex!(16, bytes[7]);
+    uuid_buf[18] = b'-';
+    write_hex!(19, bytes[8]);
+    write_hex!(21, bytes[9]);
+    uuid_buf[23] = b'-';
+    write_hex!(24, bytes[10]);
+    write_hex!(26, bytes[11]);
+    write_hex!(28, bytes[12]);
+    write_hex!(30, bytes[13]);
+    write_hex!(32, bytes[14]);
+    write_hex!(34, bytes[15]);
+
+    // SAFETY: uuid_buf contains only valid ASCII hex digits and hyphens
+    let uuid_str = unsafe { std::str::from_utf8_unchecked(&uuid_buf) };
+    let result = v8::String::new(scope, uuid_str).unwrap();
+    rv.set(result.into());
+}
+
+// crypto.subtle.digest(algorithm, data)
+#[inline]
+fn crypto_subtle_digest(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 2, "crypto.subtle.digest") {
+        return;
+    }
+
+    // Get algorithm name
+    let algorithm = args.get(0);
+    let algorithm_str = {
+        v8::tc_scope!(let tc, scope);
+        match algorithm.to_string(tc) {
+            Some(s) => s.to_rust_string_lossy(tc),
+            None => {
+                // tc_scope dropped here, so we can borrow scope mutably
+                String::new()
+            }
+        }
+    };
+
+    if algorithm_str.is_empty() && !algorithm.is_string() {
+        crate::error::throw_type_error(scope, "Invalid algorithm argument");
+        return;
+    }
+
+    // Get data
+    let data = args.get(1);
+    let data_bytes = if data.is_array_buffer_view() {
+        let view = v8::Local::<v8::ArrayBufferView>::try_from(data).unwrap();
+        let buffer = view.buffer(scope).unwrap();
+        let backing_store = buffer.get_backing_store();
+        let byte_offset = view.byte_offset();
+        let byte_length = view.byte_length();
+
+        if byte_length == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    (backing_store.data().unwrap().as_ptr() as *const u8).add(byte_offset),
+                    byte_length,
+                )
+            }
+        }
+    } else if data.is_array_buffer() {
+        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(data).unwrap();
+        let backing_store = buffer.get_backing_store();
+        let byte_length = backing_store.byte_length();
+
+        if byte_length == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    backing_store.data().unwrap().as_ptr() as *const u8,
+                    byte_length,
+                )
+            }
+        }
+    } else {
+        crate::error::throw_type_error(
+            scope,
+            "crypto.subtle.digest: data must be an ArrayBuffer or ArrayBufferView",
+        );
+        return;
+    };
+
+    // Perform hashing
+    let hash_result = match algorithm_str.as_str() {
+        "SHA-256" => digest::digest(&digest::SHA256, data_bytes),
+        "SHA-384" => digest::digest(&digest::SHA384, data_bytes),
+        "SHA-512" => digest::digest(&digest::SHA512, data_bytes),
+        _ => {
+            crate::error::throw_error(scope, &format!("Unsupported algorithm: {}", algorithm_str));
+            return;
+        }
+    };
+
+    // Create ArrayBuffer with the hash result
+    let hash_bytes = hash_result.as_ref();
+    let backing_store =
+        v8::ArrayBuffer::new_backing_store_from_vec(hash_bytes.to_vec()).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+
+    // Create a promise and resolve it with the array buffer
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, array_buffer.into());
+
+    rv.set(promise.into());
+}
+
+// Helper function to extract bytes from ArrayBuffer or ArrayBufferView
+fn get_buffer_data<'a, 'b>(
+    scope: &mut v8::PinScope<'a, 'b>,
+    value: v8::Local<v8::Value>,
+) -> Option<&'a [u8]> {
+    if value.is_array_buffer_view() {
+        let view = v8::Local::<v8::ArrayBufferView>::try_from(value).ok()?;
+        let buffer = view.buffer(scope)?;
+        let backing_store = buffer.get_backing_store();
+        let byte_offset = view.byte_offset();
+        let byte_length = view.byte_length();
+
+        if byte_length == 0 {
+            Some(&[])
+        } else {
+            Some(unsafe {
+                std::slice::from_raw_parts(
+                    (backing_store.data()?.as_ptr() as *const u8).add(byte_offset),
+                    byte_length,
+                )
+            })
+        }
+    } else if value.is_array_buffer() {
+        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(value).ok()?;
+        let backing_store = buffer.get_backing_store();
+        let byte_length = backing_store.byte_length();
+
+        if byte_length == 0 {
+            Some(&[])
+        } else {
+            Some(unsafe {
+                std::slice::from_raw_parts(backing_store.data()?.as_ptr() as *const u8, byte_length)
+            })
+        }
+    } else {
+        None
+    }
+}
+
+// crypto.subtle.sign(algorithm, key, data)
+#[inline]
+fn crypto_subtle_sign(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 3, "crypto.subtle.sign") {
+        return;
+    }
+
+    // Get cached strings
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let string_cache = state.borrow().string_cache.clone();
+    let mut cache = string_cache.borrow_mut();
+    let name_key = crate::get_or_create_cached_string!(scope, cache, name, "name");
+    let algorithm_key = crate::get_or_create_cached_string!(scope, cache, algorithm, "algorithm");
+    let hash_key = crate::get_or_create_cached_string!(scope, cache, hash, "hash");
+    let key_data_key = crate::get_or_create_cached_string!(scope, cache, key_data, "_keyData");
+    drop(cache);
+    drop(string_cache);
+
+    // Get algorithm
+    let algorithm = args.get(0);
+    let algorithm_name = if algorithm.is_string() {
+        v8::tc_scope!(let tc, scope);
+        algorithm.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    } else if algorithm.is_object() {
+        let obj = v8::Local::<v8::Object>::try_from(algorithm).unwrap();
+        let name_value = obj.get(scope, name_key.into()).unwrap();
+        v8::tc_scope!(let tc, scope);
+        name_value.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    } else {
+        crate::error::throw_type_error(scope, "Invalid algorithm");
+        return;
+    };
+
+    // Get key (must be an object with algorithm and key data)
+    let key = args.get(1);
+    if !key.is_object() {
+        crate::error::throw_type_error(scope, "Key must be an object");
+        return;
+    }
+
+    let key_obj = v8::Local::<v8::Object>::try_from(key).unwrap();
+    let key_data_val = key_obj.get(scope, key_data_key.into()).unwrap();
+
+    let key_bytes = match get_buffer_data(scope, key_data_val) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Invalid key data");
+            return;
+        }
+    };
+
+    // Get data to sign
+    let data = args.get(2);
+    let data_bytes = match get_buffer_data(scope, data) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Data must be an ArrayBuffer or ArrayBufferView");
+            return;
+        }
+    };
+
+    // Perform signing based on algorithm
+    let signature = match algorithm_name.as_str() {
+        "HMAC" => {
+            // Get hash algorithm from key
+            let key_alg_obj = key_obj.get(scope, algorithm_key.into()).unwrap();
+
+            if !key_alg_obj.is_object() {
+                crate::error::throw_error(scope, "Invalid key algorithm");
+                return;
+            }
+
+            let key_alg = v8::Local::<v8::Object>::try_from(key_alg_obj).unwrap();
+            let hash_obj = key_alg.get(scope, hash_key.into()).unwrap();
+
+            let hash_name = if hash_obj.is_string() {
+                v8::tc_scope!(let tc, scope);
+                hash_obj.to_string(tc).unwrap().to_rust_string_lossy(tc)
+            } else if hash_obj.is_object() {
+                let hash_obj = v8::Local::<v8::Object>::try_from(hash_obj).unwrap();
+                let name_val = hash_obj.get(scope, name_key.into()).unwrap();
+                v8::tc_scope!(let tc, scope);
+                name_val.to_string(tc).unwrap().to_rust_string_lossy(tc)
+            } else {
+                crate::error::throw_error(scope, "Invalid hash algorithm");
+                return;
+            };
+
+            let hmac_algorithm = match hash_name.as_str() {
+                "SHA-256" => hmac::HMAC_SHA256,
+                "SHA-384" => hmac::HMAC_SHA384,
+                "SHA-512" => hmac::HMAC_SHA512,
+                _ => {
+                    crate::error::throw_error(scope, &format!("Unsupported hash: {}", hash_name));
+                    return;
+                }
+            };
+
+            let key = hmac::Key::new(hmac_algorithm, key_bytes);
+            let tag = hmac::sign(&key, data_bytes);
+            tag.as_ref().to_vec()
+        }
+        _ => {
+            crate::error::throw_error(
+                scope,
+                &format!("Unsupported signing algorithm: {}", algorithm_name),
+            );
+            return;
+        }
+    };
+
+    // Create ArrayBuffer with signature
+    let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(signature).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+
+    // Create and resolve promise
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, array_buffer.into());
+
+    rv.set(promise.into());
+}
+
+// crypto.subtle.verify(algorithm, key, signature, data)
+#[inline]
+fn crypto_subtle_verify(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 4, "crypto.subtle.verify") {
+        return;
+    }
+
+    // Get cached strings
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let string_cache = state.borrow().string_cache.clone();
+    let mut cache = string_cache.borrow_mut();
+    let name_key = crate::get_or_create_cached_string!(scope, cache, name, "name");
+    let algorithm_key = crate::get_or_create_cached_string!(scope, cache, algorithm, "algorithm");
+    let hash_key = crate::get_or_create_cached_string!(scope, cache, hash, "hash");
+    let key_data_key = crate::get_or_create_cached_string!(scope, cache, key_data, "_keyData");
+    drop(cache);
+    drop(string_cache);
+
+    // Get algorithm
+    let algorithm = args.get(0);
+    let algorithm_name = if algorithm.is_string() {
+        v8::tc_scope!(let tc, scope);
+        algorithm.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    } else if algorithm.is_object() {
+        let obj = v8::Local::<v8::Object>::try_from(algorithm).unwrap();
+        let name_value = obj.get(scope, name_key.into()).unwrap();
+        v8::tc_scope!(let tc, scope);
+        name_value.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    } else {
+        crate::error::throw_type_error(scope, "Invalid algorithm");
+        return;
+    };
+
+    // Get key
+    let key = args.get(1);
+    if !key.is_object() {
+        crate::error::throw_type_error(scope, "Key must be an object");
+        return;
+    }
+
+    let key_obj = v8::Local::<v8::Object>::try_from(key).unwrap();
+    let key_data_val = key_obj.get(scope, key_data_key.into()).unwrap();
+
+    let key_bytes = match get_buffer_data(scope, key_data_val) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Invalid key data");
+            return;
+        }
+    };
+
+    // Get signature
+    let signature = args.get(2);
+    let signature_bytes = match get_buffer_data(scope, signature) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(
+                scope,
+                "Signature must be an ArrayBuffer or ArrayBufferView",
+            );
+            return;
+        }
+    };
+
+    // Get data
+    let data = args.get(3);
+    let data_bytes = match get_buffer_data(scope, data) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Data must be an ArrayBuffer or ArrayBufferView");
+            return;
+        }
+    };
+
+    // Perform verification
+    let is_valid = match algorithm_name.as_str() {
+        "HMAC" => {
+            // Get hash algorithm from key
+            let key_alg_obj = key_obj.get(scope, algorithm_key.into()).unwrap();
+
+            if !key_alg_obj.is_object() {
+                crate::error::throw_error(scope, "Invalid key algorithm");
+                return;
+            }
+
+            let key_alg = v8::Local::<v8::Object>::try_from(key_alg_obj).unwrap();
+            let hash_obj = key_alg.get(scope, hash_key.into()).unwrap();
+
+            let hash_name = if hash_obj.is_string() {
+                v8::tc_scope!(let tc, scope);
+                hash_obj.to_string(tc).unwrap().to_rust_string_lossy(tc)
+            } else if hash_obj.is_object() {
+                let hash_obj = v8::Local::<v8::Object>::try_from(hash_obj).unwrap();
+                let name_val = hash_obj.get(scope, name_key.into()).unwrap();
+                v8::tc_scope!(let tc, scope);
+                name_val.to_string(tc).unwrap().to_rust_string_lossy(tc)
+            } else {
+                crate::error::throw_error(scope, "Invalid hash algorithm");
+                return;
+            };
+
+            let hmac_algorithm = match hash_name.as_str() {
+                "SHA-256" => hmac::HMAC_SHA256,
+                "SHA-384" => hmac::HMAC_SHA384,
+                "SHA-512" => hmac::HMAC_SHA512,
+                _ => {
+                    crate::error::throw_error(scope, &format!("Unsupported hash: {}", hash_name));
+                    return;
+                }
+            };
+
+            let key = hmac::Key::new(hmac_algorithm, key_bytes);
+            hmac::verify(&key, data_bytes, signature_bytes).is_ok()
+        }
+        _ => {
+            crate::error::throw_error(
+                scope,
+                &format!("Unsupported verification algorithm: {}", algorithm_name),
+            );
+            return;
+        }
+    };
+
+    // Create and resolve promise with boolean result
+    let result = v8::Boolean::new(scope, is_valid);
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, result.into());
+
+    rv.set(promise.into());
+}
+
+// crypto.subtle.encrypt(algorithm, key, data)
+#[inline]
+fn crypto_subtle_encrypt(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 3, "crypto.subtle.encrypt") {
+        return;
+    }
+
+    // Get cached strings
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let string_cache = state.borrow().string_cache.clone();
+    let mut cache = string_cache.borrow_mut();
+    let name_key = crate::get_or_create_cached_string!(scope, cache, name, "name");
+    let key_data_key = crate::get_or_create_cached_string!(scope, cache, key_data, "_keyData");
+    let iv_key = crate::get_or_create_cached_string!(scope, cache, iv, "iv");
+    let additional_data_key =
+        crate::get_or_create_cached_string!(scope, cache, additional_data, "additionalData");
+    drop(cache);
+    drop(string_cache);
+
+    // Get algorithm
+    let algorithm = args.get(0);
+    if !algorithm.is_object() {
+        crate::error::throw_type_error(scope, "Algorithm must be an object");
+        return;
+    }
+
+    let alg_obj = v8::Local::<v8::Object>::try_from(algorithm).unwrap();
+    let name_value = alg_obj.get(scope, name_key.into()).unwrap();
+    let algorithm_name = {
+        v8::tc_scope!(let tc, scope);
+        name_value.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    };
+
+    // Get key
+    let key = args.get(1);
+    if !key.is_object() {
+        crate::error::throw_type_error(scope, "Key must be an object");
+        return;
+    }
+
+    let key_obj = v8::Local::<v8::Object>::try_from(key).unwrap();
+    let key_data_val = key_obj.get(scope, key_data_key.into()).unwrap();
+
+    let key_bytes = match get_buffer_data(scope, key_data_val) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Invalid key data");
+            return;
+        }
+    };
+
+    // Get data to encrypt
+    let data = args.get(2);
+    let data_bytes = match get_buffer_data(scope, data) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Data must be an ArrayBuffer or ArrayBufferView");
+            return;
+        }
+    };
+
+    // Perform encryption
+    let encrypted_data = match algorithm_name.as_str() {
+        "AES-GCM" => {
+            // Get IV from algorithm
+            let iv_value = alg_obj.get(scope, iv_key.into()).unwrap();
+            let iv_bytes = match get_buffer_data(scope, iv_value) {
+                Some(bytes) => bytes,
+                None => {
+                    crate::error::throw_type_error(
+                        scope,
+                        "IV must be an ArrayBuffer or ArrayBufferView",
+                    );
+                    return;
+                }
+            };
+
+            // Get optional additional data
+            let ad_value = alg_obj.get(scope, additional_data_key.into());
+            let ad_bytes = if let Some(ad_val) = ad_value {
+                get_buffer_data(scope, ad_val).unwrap_or(&[])
+            } else {
+                &[]
+            };
+
+            // Create unbound key
+            let unbound_key = match aead::UnboundKey::new(&aead::AES_256_GCM, key_bytes) {
+                Ok(key) => key,
+                Err(_) => {
+                    crate::error::throw_error(
+                        scope,
+                        "Invalid key length for AES-256-GCM (expected 32 bytes)",
+                    );
+                    return;
+                }
+            };
+
+            // Create nonce sequence (single use)
+            struct SingleNonce(Option<aead::Nonce>);
+            impl aead::NonceSequence for SingleNonce {
+                fn advance(&mut self) -> Result<aead::Nonce, ring::error::Unspecified> {
+                    self.0.take().ok_or(ring::error::Unspecified)
+                }
+            }
+
+            let nonce = match aead::Nonce::try_assume_unique_for_key(iv_bytes) {
+                Ok(n) => n,
+                Err(_) => {
+                    crate::error::throw_error(
+                        scope,
+                        "Invalid IV length (expected 12 bytes for AES-GCM)",
+                    );
+                    return;
+                }
+            };
+
+            let mut sealing_key = aead::SealingKey::new(unbound_key, SingleNonce(Some(nonce)));
+
+            // Pre-allocate buffer with exact size needed (data + tag)
+            let tag_len = aead::AES_256_GCM.tag_len();
+            let total_len = data_bytes.len() + tag_len;
+            let mut in_out = Vec::with_capacity(total_len);
+            in_out.extend_from_slice(data_bytes);
+            in_out.resize(total_len, 0);
+
+            // Encrypt
+            let aad = aead::Aad::from(ad_bytes);
+            match sealing_key.seal_in_place_separate_tag(aad, &mut in_out[..data_bytes.len()]) {
+                Ok(tag) => {
+                    // Append tag to encrypted data
+                    let data_len = data_bytes.len();
+                    in_out[data_len..data_len + tag.as_ref().len()].copy_from_slice(tag.as_ref());
+                    in_out.truncate(data_len + tag.as_ref().len());
+                    in_out
+                }
+                Err(_) => {
+                    crate::error::throw_error(scope, "Encryption failed");
+                    return;
+                }
+            }
+        }
+        _ => {
+            crate::error::throw_error(
+                scope,
+                &format!("Unsupported encryption algorithm: {}", algorithm_name),
+            );
+            return;
+        }
+    };
+
+    // Create ArrayBuffer with encrypted data
+    let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(encrypted_data).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+
+    // Create and resolve promise
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, array_buffer.into());
+
+    rv.set(promise.into());
+}
+
+// crypto.subtle.decrypt(algorithm, key, data)
+#[inline]
+fn crypto_subtle_decrypt(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 3, "crypto.subtle.decrypt") {
+        return;
+    }
+
+    // Get cached strings
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let string_cache = state.borrow().string_cache.clone();
+    let mut cache = string_cache.borrow_mut();
+    let name_key = crate::get_or_create_cached_string!(scope, cache, name, "name");
+    let key_data_key = crate::get_or_create_cached_string!(scope, cache, key_data, "_keyData");
+    let iv_key = crate::get_or_create_cached_string!(scope, cache, iv, "iv");
+    let additional_data_key =
+        crate::get_or_create_cached_string!(scope, cache, additional_data, "additionalData");
+    drop(cache);
+    drop(string_cache);
+
+    // Get algorithm
+    let algorithm = args.get(0);
+    if !algorithm.is_object() {
+        crate::error::throw_type_error(scope, "Algorithm must be an object");
+        return;
+    }
+
+    let alg_obj = v8::Local::<v8::Object>::try_from(algorithm).unwrap();
+    let name_value = alg_obj.get(scope, name_key.into()).unwrap();
+    let algorithm_name = {
+        v8::tc_scope!(let tc, scope);
+        name_value.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    };
+
+    // Get key
+    let key = args.get(1);
+    if !key.is_object() {
+        crate::error::throw_type_error(scope, "Key must be an object");
+        return;
+    }
+
+    let key_obj = v8::Local::<v8::Object>::try_from(key).unwrap();
+    let key_data_val = key_obj.get(scope, key_data_key.into()).unwrap();
+
+    let key_bytes = match get_buffer_data(scope, key_data_val) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Invalid key data");
+            return;
+        }
+    };
+
+    // Get data to decrypt
+    let data = args.get(2);
+    let data_bytes = match get_buffer_data(scope, data) {
+        Some(bytes) => bytes,
+        None => {
+            crate::error::throw_type_error(scope, "Data must be an ArrayBuffer or ArrayBufferView");
+            return;
+        }
+    };
+
+    // Perform decryption
+    let decrypted_data = match algorithm_name.as_str() {
+        "AES-GCM" => {
+            // Get IV from algorithm
+            let iv_value = alg_obj.get(scope, iv_key.into()).unwrap();
+            let iv_bytes = match get_buffer_data(scope, iv_value) {
+                Some(bytes) => bytes,
+                None => {
+                    crate::error::throw_type_error(
+                        scope,
+                        "IV must be an ArrayBuffer or ArrayBufferView",
+                    );
+                    return;
+                }
+            };
+
+            // Get optional additional data
+            let ad_value = alg_obj.get(scope, additional_data_key.into());
+            let ad_bytes = if let Some(ad_val) = ad_value {
+                get_buffer_data(scope, ad_val).unwrap_or(&[])
+            } else {
+                &[]
+            };
+
+            // Create unbound key
+            let unbound_key = match aead::UnboundKey::new(&aead::AES_256_GCM, key_bytes) {
+                Ok(key) => key,
+                Err(_) => {
+                    crate::error::throw_error(
+                        scope,
+                        "Invalid key length for AES-256-GCM (expected 32 bytes)",
+                    );
+                    return;
+                }
+            };
+
+            // Create nonce sequence (single use)
+            struct SingleNonce(Option<aead::Nonce>);
+            impl aead::NonceSequence for SingleNonce {
+                fn advance(&mut self) -> Result<aead::Nonce, ring::error::Unspecified> {
+                    self.0.take().ok_or(ring::error::Unspecified)
+                }
+            }
+
+            let nonce = match aead::Nonce::try_assume_unique_for_key(iv_bytes) {
+                Ok(n) => n,
+                Err(_) => {
+                    crate::error::throw_error(
+                        scope,
+                        "Invalid IV length (expected 12 bytes for AES-GCM)",
+                    );
+                    return;
+                }
+            };
+
+            let mut opening_key = aead::OpeningKey::new(unbound_key, SingleNonce(Some(nonce)));
+
+            // Pre-allocate buffer with exact size for decryption
+            let mut in_out = Vec::with_capacity(data_bytes.len());
+            in_out.extend_from_slice(data_bytes);
+
+            // Decrypt
+            let aad = aead::Aad::from(ad_bytes);
+            match opening_key.open_in_place(aad, &mut in_out) {
+                Ok(plaintext) => plaintext.to_vec(),
+                Err(_) => {
+                    crate::error::throw_error(scope, "Decryption failed");
+                    return;
+                }
+            }
+        }
+        _ => {
+            crate::error::throw_error(
+                scope,
+                &format!("Unsupported decryption algorithm: {}", algorithm_name),
+            );
+            return;
+        }
+    };
+
+    // Create ArrayBuffer with decrypted data
+    let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(decrypted_data).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+
+    // Create and resolve promise
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, array_buffer.into());
+
+    rv.set(promise.into());
+}
+
+// crypto.subtle.generateKey(algorithm, extractable, keyUsages)
+#[inline]
+fn crypto_subtle_generate_key(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 3, "crypto.subtle.generateKey") {
+        return;
+    }
+
+    // Get cached strings
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let string_cache = state.borrow().string_cache.clone();
+    let mut cache = string_cache.borrow_mut();
+    let name_key = crate::get_or_create_cached_string!(scope, cache, name, "name");
+    let algorithm_key = crate::get_or_create_cached_string!(scope, cache, algorithm, "algorithm");
+    let hash_key = crate::get_or_create_cached_string!(scope, cache, hash, "hash");
+    let extractable_key =
+        crate::get_or_create_cached_string!(scope, cache, extractable, "extractable");
+    let usages_key = crate::get_or_create_cached_string!(scope, cache, usages, "usages");
+    let type_key = crate::get_or_create_cached_string!(scope, cache, type_, "type");
+    let secret_key = crate::get_or_create_cached_string!(scope, cache, secret, "secret");
+    let key_data_key = crate::get_or_create_cached_string!(scope, cache, key_data, "_keyData");
+    let length_key = crate::get_or_create_cached_string!(scope, cache, length, "length");
+    drop(cache);
+    drop(string_cache);
+
+    // Get algorithm
+    let algorithm = args.get(0);
+    if !algorithm.is_object() {
+        crate::error::throw_type_error(scope, "Algorithm must be an object");
+        return;
+    }
+
+    let alg_obj = v8::Local::<v8::Object>::try_from(algorithm).unwrap();
+    let name_value = alg_obj.get(scope, name_key.into()).unwrap();
+    let algorithm_name = {
+        v8::tc_scope!(let tc, scope);
+        name_value.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    };
+
+    // Get extractable
+    let extractable = args.get(1).boolean_value(scope);
+
+    // Get key usages (array of strings)
+    let usages = args.get(2);
+    if !usages.is_array() {
+        crate::error::throw_type_error(scope, "Key usages must be an array");
+        return;
+    }
+
+    // Generate key based on algorithm
+    let key_data = match algorithm_name.as_str() {
+        "AES-GCM" => {
+            // Get length from algorithm
+            let length_value = alg_obj.get(scope, length_key.into()).unwrap();
+            let length = length_value.uint32_value(scope).unwrap_or(256);
+
+            if length != 128 && length != 192 && length != 256 {
+                crate::error::throw_error(scope, "AES key length must be 128, 192, or 256");
+                return;
+            }
+
+            let byte_length = (length / 8) as usize;
+            let mut key_bytes = vec![0u8; byte_length];
+            {
+                let state = crate::isolate_state::IsolateState::get(scope);
+                let state_ref = state.borrow();
+                let mut buffered_random = state_ref.buffered_random.borrow_mut();
+                if buffered_random.fill(&mut key_bytes).is_err() {
+                    drop(buffered_random);
+                    drop(state_ref);
+                    crate::error::throw_error(scope, "Failed to generate random key");
+                    return;
+                }
+            }
+            key_bytes
+        }
+        "HMAC" => {
+            // Get hash algorithm
+            let hash_value = alg_obj.get(scope, hash_key.into()).unwrap();
+
+            let hash_name = if hash_value.is_string() {
+                v8::tc_scope!(let tc, scope);
+                hash_value.to_string(tc).unwrap().to_rust_string_lossy(tc)
+            } else if hash_value.is_object() {
+                let hash_obj = v8::Local::<v8::Object>::try_from(hash_value).unwrap();
+                let name_val = hash_obj.get(scope, name_key.into()).unwrap();
+                v8::tc_scope!(let tc, scope);
+                name_val.to_string(tc).unwrap().to_rust_string_lossy(tc)
+            } else {
+                crate::error::throw_error(scope, "Invalid hash algorithm");
+                return;
+            };
+
+            // Get optional length
+            let length_value = alg_obj.get(scope, length_key.into());
+            let byte_length = if let Some(len_val) = length_value {
+                if len_val.is_number() {
+                    (len_val.uint32_value(scope).unwrap_or(512) / 8) as usize
+                } else {
+                    // Default based on hash
+                    match hash_name.as_str() {
+                        "SHA-256" => 32,
+                        "SHA-384" => 48,
+                        "SHA-512" => 64,
+                        _ => 32,
+                    }
+                }
+            } else {
+                // Default based on hash
+                match hash_name.as_str() {
+                    "SHA-256" => 32,
+                    "SHA-384" => 48,
+                    "SHA-512" => 64,
+                    _ => 32,
+                }
+            };
+
+            let mut key_bytes = vec![0u8; byte_length];
+            {
+                let state = crate::isolate_state::IsolateState::get(scope);
+                let state_ref = state.borrow();
+                let mut buffered_random = state_ref.buffered_random.borrow_mut();
+                if buffered_random.fill(&mut key_bytes).is_err() {
+                    drop(buffered_random);
+                    drop(state_ref);
+                    crate::error::throw_error(scope, "Failed to generate random key");
+                    return;
+                }
+            }
+            key_bytes
+        }
+        _ => {
+            crate::error::throw_error(
+                scope,
+                &format!("Unsupported key generation algorithm: {}", algorithm_name),
+            );
+            return;
+        }
+    };
+
+    // Create key object
+    // Store key data in ArrayBuffer
+    let key_backing_store = v8::ArrayBuffer::new_backing_store_from_vec(key_data).make_shared();
+    let key_buffer = v8::ArrayBuffer::with_backing_store(scope, &key_backing_store);
+
+    let key_obj = v8::Object::new(scope);
+
+    // Set algorithm
+    key_obj.set(scope, algorithm_key.into(), algorithm);
+
+    // Set extractable
+    let ext_val = v8::Boolean::new(scope, extractable);
+    key_obj.set(scope, extractable_key.into(), ext_val.into());
+
+    // Set usages
+    key_obj.set(scope, usages_key.into(), usages);
+
+    // Set type
+    // Use cached "secret" string as type value
+    key_obj.set(scope, type_key.into(), secret_key.into());
+
+    // Set key data (private property)
+    key_obj.set(scope, key_data_key.into(), key_buffer.into());
+
+    // Create and resolve promise
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, key_obj.into());
+
+    rv.set(promise.into());
+}
+
+// crypto.subtle.importKey(format, keyData, algorithm, extractable, keyUsages)
+#[inline]
+fn crypto_subtle_import_key(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 5, "crypto.subtle.importKey") {
+        return;
+    }
+
+    // Get cached strings
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let string_cache = state.borrow().string_cache.clone();
+    let mut cache = string_cache.borrow_mut();
+    let algorithm_key = crate::get_or_create_cached_string!(scope, cache, algorithm, "algorithm");
+    let extractable_key =
+        crate::get_or_create_cached_string!(scope, cache, extractable, "extractable");
+    let usages_key = crate::get_or_create_cached_string!(scope, cache, usages, "usages");
+    let type_key = crate::get_or_create_cached_string!(scope, cache, type_, "type");
+    let secret_key = crate::get_or_create_cached_string!(scope, cache, secret, "secret");
+    let key_data_key = crate::get_or_create_cached_string!(scope, cache, key_data, "_keyData");
+    drop(cache);
+    drop(string_cache);
+
+    // Get format
+    let format = args.get(0);
+    let format_str = {
+        v8::tc_scope!(let tc, scope);
+        format.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    };
+
+    // Get key data
+    let key_data = args.get(1);
+    let key_bytes = match get_buffer_data(scope, key_data) {
+        Some(bytes) => bytes.to_vec(),
+        None => {
+            crate::error::throw_type_error(
+                scope,
+                "Key data must be an ArrayBuffer or ArrayBufferView",
+            );
+            return;
+        }
+    };
+
+    // Get algorithm
+    let algorithm = args.get(2);
+    if !algorithm.is_object() {
+        crate::error::throw_type_error(scope, "Algorithm must be an object");
+        return;
+    }
+
+    // Get extractable
+    let extractable = args.get(3).boolean_value(scope);
+
+    // Get key usages
+    let usages = args.get(4);
+    if !usages.is_array() {
+        crate::error::throw_type_error(scope, "Key usages must be an array");
+        return;
+    }
+
+    // Validate format
+    if format_str != "raw" {
+        crate::error::throw_error(
+            scope,
+            &format!(
+                "Unsupported key format: {} (only 'raw' is supported)",
+                format_str
+            ),
+        );
+        return;
+    }
+
+    // Create key object
+    let key_backing_store = v8::ArrayBuffer::new_backing_store_from_vec(key_bytes).make_shared();
+    let key_buffer = v8::ArrayBuffer::with_backing_store(scope, &key_backing_store);
+
+    let key_obj = v8::Object::new(scope);
+
+    // Set algorithm
+    key_obj.set(scope, algorithm_key.into(), algorithm);
+
+    // Set extractable
+    let ext_val = v8::Boolean::new(scope, extractable);
+    key_obj.set(scope, extractable_key.into(), ext_val.into());
+
+    // Set usages
+    key_obj.set(scope, usages_key.into(), usages);
+
+    // Set type
+    // Use cached "secret" string as type value
+    key_obj.set(scope, type_key.into(), secret_key.into());
+
+    // Set key data (private property)
+    key_obj.set(scope, key_data_key.into(), key_buffer.into());
+
+    // Create and resolve promise
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, key_obj.into());
+
+    rv.set(promise.into());
+}
+
+// crypto.subtle.exportKey(format, key)
+#[inline]
+fn crypto_subtle_export_key(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    if !crate::error::check_arg_count(scope, &args, 2, "crypto.subtle.exportKey") {
+        return;
+    }
+
+    // Get cached strings
+    let state = crate::isolate_state::IsolateState::get(scope);
+    let string_cache = state.borrow().string_cache.clone();
+    let mut cache = string_cache.borrow_mut();
+    let extractable_key =
+        crate::get_or_create_cached_string!(scope, cache, extractable, "extractable");
+    let key_data_key = crate::get_or_create_cached_string!(scope, cache, key_data, "_keyData");
+    drop(cache);
+    drop(string_cache);
+
+    // Get format
+    let format = args.get(0);
+    let format_str = {
+        v8::tc_scope!(let tc, scope);
+        format.to_string(tc).unwrap().to_rust_string_lossy(tc)
+    };
+
+    // Get key
+    let key = args.get(1);
+    if !key.is_object() {
+        crate::error::throw_type_error(scope, "Key must be an object");
+        return;
+    }
+
+    let key_obj = v8::Local::<v8::Object>::try_from(key).unwrap();
+
+    // Check if key is extractable
+    let ext_value = key_obj.get(scope, extractable_key.into()).unwrap();
+    if !ext_value.boolean_value(scope) {
+        crate::error::throw_error(scope, "Key is not extractable");
+        return;
+    }
+
+    // Validate format
+    if format_str != "raw" {
+        crate::error::throw_error(
+            scope,
+            &format!(
+                "Unsupported key format: {} (only 'raw' is supported)",
+                format_str
+            ),
+        );
+        return;
+    }
+
+    // Get key data
+    let key_data_val = key_obj.get(scope, key_data_key.into()).unwrap();
+
+    let key_bytes = match get_buffer_data(scope, key_data_val) {
+        Some(bytes) => bytes.to_vec(),
+        None => {
+            crate::error::throw_type_error(scope, "Invalid key data");
+            return;
+        }
+    };
+
+    // Create ArrayBuffer with key data
+    let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(key_bytes).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+
+    // Create and resolve promise
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, array_buffer.into());
+
+    rv.set(promise.into());
+}
